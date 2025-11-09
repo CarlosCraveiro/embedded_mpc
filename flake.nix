@@ -15,7 +15,7 @@
           packages = with pkgs; [
             gcc          # fornece g++
             onnxruntime
-            qpOASES
+            qpoases
             eigen
           ];
         };
