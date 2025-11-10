@@ -1,19 +1,9 @@
 // file: embedded_controller_server.cpp
-// build: g++ -O2 -std=c++17 embedded_controller_server.cpp -o embedded_server
+// build: g++ -O2 -std=c++17 embedded_controller_server.cpp communicator.cpp qpoases_utils.cpp -o embedded_server
 // run:   ./embedded_server 5555
 
-#include <arpa/inet.h>
-#include <netinet/in.h>
-#include <sys/socket.h>
-#include <unistd.h>
-
-#include <cerrno>
-#include <cstring>
 #include <iostream>
-#include <sstream>
 #include <string>
-#include <vector>
-#include <optional>
 
 // === Eigen (dense + sparse) ===
 #include <eigen3/Eigen/Dense>
@@ -26,139 +16,10 @@
 #include "bounds.hpp"
 #include "mpc_matrices.hpp"
 
-// A: ponteiro para dados row-wise, com tamanho rows*cols
-inline void print_matriz_qpoases(const qpOASES::real_t* A,
-                                 std::size_t rows,
-                                 std::size_t cols)
-{
-    for (std::size_t r = 0; r < rows; ++r) {
-        for (std::size_t c = 0; c < cols; ++c) {
-            std::cout << A[r * cols + c];
-            if (c + 1 < cols) std::cout << ' ';
-        }
-        std::cout << '\n';
-    }
-}
+#include "qpoases_utils.hpp"
+#include "icontroller.hpp"
+#include "communicator.hpp"
 
-// Converte uma Eigen::SparseMatrix<double> para um buffer DENSO row-wise de qpOASES::real_t.
-// Retorna ponteiro alocado com malloc (use std::free depois).
-inline qpOASES::real_t* to_rowwise_dense(const Eigen::SparseMatrix<double>& B) {
-    const int m = B.rows();
-    const int n = B.cols();
-
-    const size_t len = static_cast<size_t>(m) * static_cast<size_t>(n);
-    qpOASES::real_t* buf = static_cast<qpOASES::real_t*>(
-        std::malloc(len * sizeof(qpOASES::real_t))
-    );
-    if (!buf) throw std::bad_alloc{};
-
-    // zera tudo (entradas implícitas do sparse viram 0)
-    std::fill_n(buf, len, static_cast<qpOASES::real_t>(0));
-
-    // (opcional) B.makeCompressed();
-
-    // copia somente os não-nulos para as posições row-wise corretas
-    for (int k = 0; k < B.outerSize(); ++k) {
-        for (Eigen::SparseMatrix<double>::InnerIterator it(B, k); it; ++it) {
-            const int i = it.row();
-            const int j = it.col();
-            buf[static_cast<size_t>(i) * static_cast<size_t>(n) + static_cast<size_t>(j)]
-                = static_cast<qpOASES::real_t>(it.value());
-        }
-    }
-
-    return buf; // lembre-se de std::free(buf)
-}
-
-// Converte um Eigen::VectorXd para um buffer contíguo de qpOASES::real_t.
-// Retorna ponteiro alocado com malloc (use std::free depois).
-inline qpOASES::real_t* to_buffer(const Eigen::VectorXd& v) {
-    const Eigen::Index n = v.size();
-    qpOASES::real_t* buf = static_cast<qpOASES::real_t*>(
-        std::malloc(static_cast<size_t>(n) * sizeof(qpOASES::real_t))
-    );
-    if (!buf) throw std::bad_alloc{};
-
-    for (Eigen::Index i = 0; i < n; ++i) {
-        buf[i] = static_cast<qpOASES::real_t>(v[i]);
-    }
-    return buf; // lembre-se de std::free(buf)
-}
-
-// ---------------- IO helpers (line-based) ----------------
-static bool read_line(int fd, std::string& out) {
-    out.clear();
-    char c;
-    while (true) {
-        ssize_t n = ::recv(fd, &c, 1, 0);
-        if (n == 0) return false;           // peer fechou
-        if (n < 0) {
-            if (errno == EINTR) continue;   // sinal; tenta de novo
-            return false;
-        }
-        if (c == '\n') break;
-        if (c == '\r') continue;            // tolera CRLF
-        out.push_back(c);
-        if (out.size() > 2'000'000) return false; // proteção contra linha gigante
-    }
-    return true;
-}
-
-static bool write_line(int fd, const std::string& s) {
-    std::string msg = s + "\n";
-    const char* p = msg.c_str();
-    size_t left = msg.size();
-    while (left > 0) {
-        ssize_t n = ::send(fd, p, left, 0);
-        if (n < 0) {
-            if (errno == EINTR) continue;
-            return false;
-        }
-        left -= static_cast<size_t>(n);
-        p += n;
-    }
-    return true;
-}
-
-// ---------------- CSV helpers ----------------
-static std::optional<std::pair<std::string,std::string>>
-split_once_bar(const std::string& line) {
-    auto pos = line.find('|');
-    if (pos == std::string::npos) return std::nullopt;
-    return std::make_pair(line.substr(0, pos), line.substr(pos + 1));
-}
-
-static bool parse_csv_doubles(const std::string& csv, std::vector<double>& out) {
-    out.clear();
-    std::istringstream iss(csv);
-    std::string tok;
-    while (std::getline(iss, tok, ',')) {
-        if (tok.empty()) continue;
-        try {
-            out.push_back(std::stod(tok));
-        } catch (...) {
-            return false;
-        }
-    }
-    return true;
-}
-
-static std::string to_csv(const Eigen::Ref<const Eigen::VectorXd>& v) {
-    std::ostringstream oss;
-    for (Eigen::Index i = 0; i < v.size(); ++i) {
-        if (i) oss << ',';
-        oss << v[i];
-    }
-    return oss.str();
-}
-
-// ---------------- Controller interface (Eigen-friendly) ----------------
-struct IController {
-    virtual ~IController() = default;
-    // Usar Ref evita cópia e permite receber Map ou blocos de VectorXd
-    virtual Eigen::VectorXd computeU(const Eigen::Ref<const Eigen::VectorXd>& x,
-                                     const Eigen::Ref<const Eigen::VectorXd>& xref) = 0;
-};
 
 // Implementação dummy: NÃO faz contas; retorna um vetor de zeros de tamanho nu
 struct DummyController final : IController {
@@ -310,103 +171,6 @@ public:
     qpOASES::QProblem qp_;
     
 
-};
-
-// ---------------- Communicator ----------------
-class Communicator {
-public:
-    explicit Communicator(int port) : server_fd_(-1) {
-        server_fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
-        if (server_fd_ < 0) fail_here_("socket() fail");
-
-        int yes = 1;
-        ::setsockopt(server_fd_, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
-
-        sockaddr_in addr{};
-        addr.sin_family = AF_INET;
-        addr.sin_addr.s_addr = ::htonl(INADDR_ANY); // 0.0.0.0
-        addr.sin_port = ::htons(port);
-
-        if (::bind(server_fd_, (sockaddr*)&addr, sizeof(addr)) < 0) {
-            ::close(server_fd_);
-            fail_here_("bind() fail");
-        }
-        if (::listen(server_fd_, 16) < 0) {
-            ::close(server_fd_);
-            fail_here_("listen() fail");
-        }
-
-        std::cout << "[C++] Communicator ouvindo em 0.0.0.0:" << port << "\n";
-    }
-
-    ~Communicator() {
-        if (server_fd_ >= 0) ::close(server_fd_);
-    }
-
-    void serve_forever(IController& controller) {
-        while (true) {
-            sockaddr_in cli{};
-            socklen_t len = sizeof(cli);
-            int client_fd = ::accept(server_fd_, (sockaddr*)&cli, &len);
-            if (client_fd < 0) {
-                if (errno == EINTR) continue;
-                std::cerr << "accept() fail: " << std::strerror(errno) << "\n";
-                continue;
-            }
-
-            // timeouts básicos
-            timeval tv{.tv_sec = 2, .tv_usec = 0};
-            ::setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-            ::setsockopt(client_fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-
-            std::string line;
-            if (!read_line(client_fd, line)) {
-                ::close(client_fd);
-                continue;
-            }
-            // Espera "csv(x)|csv(xref)"
-            std::vector<double> vx, vxr;
-            bool ok = false;
-            if (auto both = split_once_bar(line)) {
-                ok = parse_csv_doubles(both->first, vx)
-                  && parse_csv_doubles(both->second, vxr);
-            }
-
-            if (ok) {
-                // Map sem cópia para Eigen::VectorXd
-                Eigen::Map<const Eigen::VectorXd> x(vx.data(),  static_cast<Eigen::Index>(vx.size()));
-                Eigen::Map<const Eigen::VectorXd> xr(vxr.data(), static_cast<Eigen::Index>(vxr.size()));
-
-                Eigen::VectorXd u;
-                try {
-                    u = controller.computeU(x, xr);
-                } catch (const std::exception& e) {
-                    (void)e;
-                    u = Eigen::VectorXd(); // vazio → mandaremos "nan"
-                } catch (...) {
-                    u = Eigen::VectorXd();
-                }
-
-                if (u.size() > 0) {
-                    write_line(client_fd, to_csv(u));
-                } else {
-                    write_line(client_fd, "nan");
-                }
-            } else {
-                write_line(client_fd, "nan");
-            }
-
-            ::close(client_fd);
-        }
-    }
-
-private:
-    int server_fd_;
-
-    [[noreturn]] static void fail_here_(const char* what) {
-        std::cerr << what << ": " << std::strerror(errno) << "\n";
-        std::exit(1);
-    }
 };
 
 // ---------------- main ----------------
