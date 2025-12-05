@@ -21,6 +21,8 @@
 #include "communicator.hpp"
 
 
+#include "qpoases_logging.hpp"
+
 // Implementação dummy: NÃO faz contas; retorna um vetor de zeros de tamanho nu
 struct DummyController final : IController {
     explicit DummyController(Eigen::Index nu, Eigen::Index nx, Eigen::Index nh)
@@ -61,12 +63,27 @@ struct DummyController final : IController {
 	options.printLevel = qpOASES::PL_LOW;
 	qp_.setOptions(options);
 
-	int nWSR = 10000;
-  	qpOASES::returnValue rv = qp_.init(B_dense, b_dense, D_dense, nullptr, nullptr, lbA_dense, ubA_dense, nWSR);
-  	if (rv != qpOASES::SUCCESSFUL_RETURN) {
-    		std::cerr << "qpOASES: init falhou (code " << rv << ")\n";
-  	}
+	//int nWSR = 10000;
+  	//qpOASES::returnValue rv = qp_.init(B_dense, b_dense, D_dense, nullptr, nullptr, lbA_dense, ubA_dense, nWSR);
+  	//if (rv != qpOASES::SUCCESSFUL_RETURN) {
+    	//	std::cerr << "qpOASES: init falhou (code " << rv << ")\n";
+  	//}
 	
+	int nWSR = 10000;
+	qpOASES::real_t cputime = 1e6;
+        qpOASES::returnValue rv =
+            qp_.init(B_dense, b_dense, D_dense,
+                     nullptr, nullptr,
+                     lbA_dense, ubA_dense,
+                     nWSR, &cputime);
+
+        if (rv != qpOASES::SUCCESSFUL_RETURN) {
+            std::cerr << "qpOASES: init falhou (code " << rv << ")\n";
+        }
+
+        // se quiser logar também a inicialização como k = 0:
+        log_qpoases_results(QPOASES_LOGFILE, 0, qp_, rv, nWSR, cputime);
+
 	// AAA TESTAR SE A SOLUCAO TA BATENDO COM O QUE TEM LA!
 	//qpOASES::real_t z[320];
 	//qp_.getPrimalSolution(z);	
@@ -127,8 +144,20 @@ struct DummyController final : IController {
 	    }
 	}
 
+	//int nWSR = 10000;
+	//qp_.hotstart(b_dense_, nullptr, nullptr, lbA_dense_, ubA_dense_, nWSR);
 	int nWSR = 10000;
-	qp_.hotstart(b_dense_, nullptr, nullptr, lbA_dense_, ubA_dense_, nWSR);
+        qpOASES::real_t cputime = 1e6;
+
+        qpOASES::returnValue rv =
+            qp_.hotstart(b_dense_, nullptr, nullptr,
+                         lbA_dense_, ubA_dense_,
+                         nWSR, &cputime);
+
+        // loga a cada chamada do controlador
+        log_qpoases_results(QPOASES_LOGFILE, step_, qp_, rv, nWSR, cputime);
+        ++step_;
+
 	qpOASES::real_t z[320];
 	
 	qp_.getPrimalSolution(z);
@@ -169,7 +198,7 @@ public:
     Eigen::Matrix<double, 12, 12> P_;
     Eigen::Matrix<double, 12, 12> Q_;
     qpOASES::QProblem qp_;
-    
+    int step_{1}; // começa em 1 porque usei 0 pra init, se quiser
 
 };
 
@@ -177,6 +206,8 @@ public:
 int main(int argc, char** argv) {
     int port = 5555;
     if (argc >= 2) port = std::stoi(argv[1]);
+    
+    init_qpoases_log(QPOASES_LOGFILE);
 
     Communicator comm(port);
 
